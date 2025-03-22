@@ -37,7 +37,7 @@ for (const asset of Object.keys(assets)) {
             current: null,              // Current active OHLC candle
             lastClose: null,            // Last finalized closing price
             lastFinalized: null,        // Timestamp of last saved candle
-            filename: `${ crucifix}_15m_OHLC.jsonl` // File to store 15m OHLC data
+            filename: `${asset}_15m_OHLC.jsonl` // File to store 15m OHLC data (fixed from ${ crucifix})
         }
     };
 }
