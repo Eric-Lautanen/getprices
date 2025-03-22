@@ -2,10 +2,9 @@ process.removeAllListeners('warning');
 import { Connection, PublicKey } from '@solana/web3.js';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 
-
 const SESSION_HASH = `PRICES${Math.ceil(Math.random() * 1e9)}`;
 const RPC_URL = 'https://solana-rpc.publicnode.com';
-const WS_URL = 'WS_RPC_URL_LIKE_FREE_HELIUS_WORKS_GREAT';
+const WS_URL = 'wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY';
 const publicKey = new PublicKey('11111111111111111111111111111111');
 const MAX_BUFFER_SIZE = 1000;
 
@@ -31,27 +30,45 @@ const timeframes = {
 };
 let isSaving = {};
 
-const streamToUSDC = lamports => lamports / 1e8;
 const priceHandlers = [
-    { prefix: 'pyth price:', label: 'Solana PythNet' },
-    { prefix: 'doves ag price:', label: 'Solana Doves' }
+    { pattern: /pyth price:\s*(\d+)/, label: 'Solana PythNet' },
+    { pattern: /doves ag price:\s*(\d+)/, label: 'Solana Doves' },
+    { pattern: /edge price:\s*(\d+)/, label: 'Edge Price' },
+    { pattern: /cl price:\s*(\d+)/, label: 'CL Price' },
+    { pattern: /exit price:\s*(\d+)/, label: 'Exit Price' }
 ];
 
 function getIntervalStart(timestamp, intervalMs) {
     return new Date(Math.floor(timestamp.getTime() / intervalMs) * intervalMs);
 }
 
-function processPrice(logEntry, { prefix, label }) {
-    if (!logEntry.includes(prefix)) return null;
+function processPrice(logEntry) {
+    const prices = [];
 
-    const priceString = logEntry.split(prefix)[1]?.split(',')[0]?.trim();
-    if (!priceString || isNaN(priceString)) {
-        console.log(`[PRICE] Invalid price format for ${label}: ${priceString}`);
-        return null;
+    for (const handler of priceHandlers) {
+        const match = logEntry.match(handler.pattern);
+        if (match && match[1]) {
+            // Convert price from lamports or other units to USDC-like scale
+            let rawPrice = parseInt(match[1], 10);
+            let price;
+
+            // Adjust scaling based on observed log data
+            if (handler.label === 'Exit Price') {
+                // Exit price seems to be in a different scale (e.g., 128845000 -> ~128.84 USDC)
+                price = Math.round((rawPrice / 1e6) * 100) / 100; // Adjust divisor based on scale
+            } else {
+                // Standard prices (pyth, doves, edge, cl) in lamports-like scale (e.g., 12884500000 -> ~128.84 USDC)
+                price = Math.round((rawPrice / 1e8) * 100) / 100;
+            }
+
+            // Validate price range (e.g., between 50 and 500 USDC)
+            if (price >= 50 && price <= 500) {
+                prices.push({ price, label: handler.label });
+            }
+        }
     }
 
-    const price = Math.round((streamToUSDC(parseFloat(priceString))) * 100) / 100;
-    return (price > 100 && price < 300) ? price : null;
+    return prices.length > 0 ? prices : null;
 }
 
 async function loadOhlcData() {
@@ -240,13 +257,11 @@ async function monitorLogs() {
         const subscriptionId = connection.onLogs(
             publicKey,
             ({ logs, err }) => {
-                const prices = logs.flatMap(log => 
-                    priceHandlers.map(h => processPrice(log, h)).filter(p => p !== null)
-                );
-                if (prices.length) {
-                    const finalPrice = prices.length > 1 
-                        ? prices.reduce((sum, p) => sum + p, 0) / prices.length
-                        : prices[0];
+                const priceData = logs.flatMap(log => processPrice(log) || []);
+                if (priceData.length) {
+                    const finalPrice = priceData.length > 1 
+                        ? priceData.reduce((sum, p) => sum + p.price, 0) / priceData.length
+                        : priceData[0].price;
                     updateOhlc(finalPrice);
                 }
             },
