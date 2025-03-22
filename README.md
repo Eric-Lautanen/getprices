@@ -1,20 +1,22 @@
-# Solana OHLC Data Collector
+# Crypto OHLC Data Collector
 
-This Node.js script collects and stores Open-High-Low-Close (OHLC) data for a Solana token based on price logs from the Solana network. It monitors Solana logs for price updates and aggregates them into OHLC candles for 1-minute, 5-minute, and 15-minute timeframes.
+This Node.js script collects real-time price data for Bitcoin, Ethereum, and Solana from Kraken and Coinbase WebSocket APIs and stores Open-High-Low-Close (OHLC) data in JSON Lines format for 1-minute, 5-minute, and 15-minute timeframes.
 
 ## Features
 
--   **Real-time Price Monitoring:** Listens to Solana logs for price updates.
--   **OHLC Aggregation:** Calculates and stores OHLC data for specified timeframes.
--   **Data Persistence:** Saves OHLC data to JSON files.
--   **Error Handling:** Robust error handling for network issues and data corruption.
--   **Graceful Shutdown:** Handles SIGINT to save data before exiting.
--   **Retry Logic:** Automatically retries connection attempts.
+-   **Real-time Price Monitoring:** Subscribes to Kraken and Coinbase WebSocket feeds for live price updates.
+-   **OHLC Data Storage:** Calculates and stores OHLC data for specified timeframes.
+-   **Multiple Timeframes:** Supports 1m, 5m, and 15m timeframes for each asset.
+-   **File Storage:** Saves OHLC data to individual JSON Lines files (`<asset>_<timeframe>_OHLC.jsonl`).
+-   **Price Range Validation:** Ignores prices outside defined ranges to filter out potential erroneous data.
+-   **Graceful Shutdown:** Ensures all pending OHLC candles are saved before exiting.
+-   **Error Handling:** Robust error handling for WebSocket connections and file operations.
+-   **Load Last Close:** On startup, loads the last close price and timestamp from existing OHLC files.
 
 ## Prerequisites
 
--   Node.js (v16 or higher recommended)
--   npm or yarn
+-   Node.js (v16 or later recommended)
+-   `npm` or `yarn`
 
 ## Installation
 
@@ -28,50 +30,57 @@ This Node.js script collects and stores Open-High-Low-Close (OHLC) data for a So
 2.  Install dependencies:
 
     ```bash
-    npm install @solana/web3.js
+    npm install ws
     ```
+
+## Usage
+
+1.  Run the script:
+
+    ```bash
+    node <your_script_name>.js
+    ```
+
+2.  The script will connect to Kraken and Coinbase WebSocket APIs and start collecting price data. OHLC data will be saved to files in the same directory.
+
+3.  To stop the script, press `Ctrl+C`. This will trigger a graceful shutdown, ensuring that all pending OHLC data is saved.
 
 ## Configuration
 
-Before running the script, you need to configure the following variables in the script:
+The script uses the following configuration:
 
--   `RPC_URL`: Solana RPC URL (e.g., `https://solana-rpc.publicnode.com`).
--   `WS_URL`: Solana WebSocket RPC URL (e.g., a free Helius WebSocket URL).
--   `publicKey`: The public key of the account to monitor for logs.
--   `MAX_BUFFER_SIZE`: The maximum number of OHLC candles to store in memory before saving to a file.
--   `timeframes`: An object defining the timeframes to collect data for, including the interval, data array, current candle, and filename.
--   `priceHandlers`: An array of objects defining the price log prefixes and labels.
+-   **Assets and Price Ranges:**
 
-Example configuration:
+    ```javascript
+    const assets = {
+        'Solana': { min: 50, max: 500 },
+        'Ethereum': { min: 1000, max: 10000 },
+        'Bitcoin': { min: 30000, max: 100000 }
+    };
+    ```
 
-```javascript
-const RPC_URL = '[https://solana-rpc.publicnode.com](https://solana-rpc.publicnode.com)';
-const WS_URL = 'wss://[your-helius-rpc-url.com](https://www.google.com/search?q=your-helius-rpc-url.com)';
-const publicKey = new PublicKey('11111111111111111111111111111111');
-const MAX_BUFFER_SIZE = 1000;
+    You can modify these ranges to suit your requirements.
 
-const timeframes = {
-    '1m': {
-        interval: 1 * 60 * 1000,
-        data: [],
-        current: null,
-        filename: '1m_OHLC.json'
-    },
-    '5m': {
-        interval: 5 * 60 * 1000,
-        data: [],
-        current: null,
-        filename: '5m_OHLC.json'
-    },
-    '15m': {
-        interval: 15 * 60 * 1000,
-        data: [],
-        current: null,
-        filename: '15m_OHLC.json'
-    }
-};
+-   **Timeframes:**
 
-const priceHandlers = [
-    { prefix: 'pythnet price:', label: 'Solana PythNet' },
-    { prefix: 'doves price:', label: 'Solana Doves' }
-];
+    ```javascript
+    const timeframes = {
+        'Solana': {
+            '1m': { interval: 1 * 60 * 1000, filename: 'Solana_1m_OHLC.jsonl', /* ... */ },
+            '5m': { interval: 5 * 60 * 1000, filename: 'Solana_5m_OHLC.jsonl', /* ... */ },
+            '15m': { interval: 15 * 60 * 1000, filename: 'Solana_15m_OHLC.jsonl', /* ... */ }
+        },
+        'Ethereum': { /* ... */ },
+        'Bitcoin': { /* ... */ }
+    };
+    ```
+
+    You can add or modify timeframes and their corresponding file names.
+
+## File Format
+
+OHLC data is stored in JSON Lines format, where each line is a JSON object representing an OHLC candle. Example:
+
+```json
+{"timestamp":"2023-10-27T10:00:00.000Z","open":30000.00,"high":30100.00,"low":29900.00,"close":30050.00}
+{"timestamp":"2023-10-27T10:01:00.000Z","open":30050.00,"high":30150.00,"low":30000.00,"close":30120.00}
