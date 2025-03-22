@@ -33,8 +33,8 @@ let isSaving = {};
 
 const streamToUSDC = lamports => lamports / 1e8;
 const priceHandlers = [
-    { prefix: 'pythnet price:', label: 'Solana PythNet' },
-    { prefix: 'doves price:', label: 'Solana Doves' }
+    { prefix: 'pyth price:', label: 'Solana PythNet' },
+    { prefix: 'doves ag price:', label: 'Solana Doves' }
 ];
 
 function getIntervalStart(timestamp, intervalMs) {
