@@ -1,296 +1,332 @@
-process.removeAllListeners('warning');
-import { Connection, PublicKey } from '@solana/web3.js';
-import { readFile, writeFile, rename } from 'node:fs/promises';
+// Import WebSocket library for real-time data streaming
+import WebSocket from 'ws';
+// Import filesystem promise-based methods for file operations
+import { readFile, appendFile } from 'node:fs/promises';
 
-const SESSION_HASH = `PRICES${Math.ceil(Math.random() * 1e9)}`;
-const RPC_URL = 'https://solana-rpc.publicnode.com';
-const WS_URL = 'wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY';
-const publicKey = new PublicKey('11111111111111111111111111111111');
-const MAX_BUFFER_SIZE = 1000;
-
-const timeframes = {
-    '1m': { 
-        interval: 1 * 60 * 1000, 
-        data: [], 
-        current: null,
-        filename: '1m_OHLC.json'
-    },
-    '5m': { 
-        interval: 5 * 60 * 1000, 
-        data: [], 
-        current: null,
-        filename: '5m_OHLC.json'
-    },
-    '15m': { 
-        interval: 15 * 60 * 1000, 
-        data: [], 
-        current: null,
-        filename: '15m_OHLC.json'
-    }
+// Define price ranges per asset for validation
+const assets = {
+    'Solana': { min: 50, max: 500 },      // Solana price range in USD
+    'Ethereum': { min: 1000, max: 10000 }, // Ethereum price range in USD
+    'Bitcoin': { min: 30000, max: 150000 } // Bitcoin price range in USD
 };
+
+// Initialize timeframes object to store OHLC data structure for each asset
+const timeframes = {};
+// Loop through each asset to create timeframe configurations
+for (const asset of Object.keys(assets)) {
+    timeframes[asset] = {
+        // 1-minute timeframe configuration
+        '1m': { 
+            interval: 1 * 60 * 1000,    // Interval duration in milliseconds (1 minute)
+            current: null,              // Current active OHLC candle
+            lastClose: null,            // Last finalized closing price
+            lastFinalized: null,        // Timestamp of last saved candle
+            filename: `${asset}_1m_OHLC.jsonl` // File to store 1m OHLC data
+        },
+        // 5-minute timeframe configuration
+        '5m': { 
+            interval: 5 * 60 * 1000,    // Interval duration (5 minutes)
+            current: null,              // Current active OHLC candle
+            lastClose: null,            // Last finalized closing price
+            lastFinalized: null,        // Timestamp of last saved candle
+            filename: `${asset}_5m_OHLC.jsonl` // File to store 5m OHLC data
+        },
+        // 15-minute timeframe configuration
+        '15m': { 
+            interval: 15 * 60 * 1000,   // Interval duration (15 minutes)
+            current: null,              // Current active OHLC candle
+            lastClose: null,            // Last finalized closing price
+            lastFinalized: null,        // Timestamp of last saved candle
+            filename: `${ crucifix}_15m_OHLC.jsonl` // File to store 15m OHLC data
+        }
+    };
+}
+// Object to track ongoing save operations to prevent concurrent writes
 let isSaving = {};
 
-const priceHandlers = [
-    { pattern: /pyth price:\s*(\d+)/, label: 'Solana PythNet' },
-    { pattern: /doves ag price:\s*(\d+)/, label: 'Solana Doves' },
-    { pattern: /edge price:\s*(\d+)/, label: 'Edge Price' },
-    { pattern: /cl price:\s*(\d+)/, label: 'CL Price' },
-    { pattern: /exit price:\s*(\d+)/, label: 'Exit Price' }
-];
-
+/** Calculate the start of the current interval based on timestamp and interval duration
+ * @param {Date} timestamp - Current timestamp
+ * @param {number} intervalMs - Interval duration in milliseconds
+ * @returns {Date} Start time of current interval
+ */
 function getIntervalStart(timestamp, intervalMs) {
     return new Date(Math.floor(timestamp.getTime() / intervalMs) * intervalMs);
 }
 
-function processPrice(logEntry) {
-    const prices = [];
-
-    for (const handler of priceHandlers) {
-        const match = logEntry.match(handler.pattern);
-        if (match && match[1]) {
-            // Convert price from lamports or other units to USDC-like scale
-            let rawPrice = parseInt(match[1], 10);
-            let price;
-
-            // Adjust scaling based on observed log data
-            if (handler.label === 'Exit Price') {
-                // Exit price seems to be in a different scale (e.g., 128845000 -> ~128.84 USDC)
-                price = Math.round((rawPrice / 1e6) * 100) / 100; // Adjust divisor based on scale
-            } else {
-                // Standard prices (pyth, doves, edge, cl) in lamports-like scale (e.g., 12884500000 -> ~128.84 USDC)
-                price = Math.round((rawPrice / 1e8) * 100) / 100;
-            }
-
-            // Validate price range (e.g., between 50 and 500 USDC)
-            if (price >= 50 && price <= 500) {
-                prices.push({ price, label: handler.label });
-            }
-        }
-    }
-
-    return prices.length > 0 ? prices : null;
-}
-
+/** Check existing OHLC files on startup and load last known values
+ * Loads previous closing prices and timestamps if files exist
+ */
 async function loadOhlcData() {
-    try {
-        console.log('[INIT] Loading OHLC data...');
-        
-        for (const [tf, frame] of Object.entries(timeframes)) {
+    console.log('[INIT] Checking OHLC files...');
+    // Iterate through all assets and their timeframes
+    for (const [asset, assetFrames] of Object.entries(timeframes)) {
+        for (const [tf, frame] of Object.entries(assetFrames)) {
             try {
+                // Attempt to read existing OHLC file
                 const data = await readFile(frame.filename, 'utf8');
-                if (data.trim() === '') {
-                    console.log(`[INIT] ${frame.filename} is empty - starting fresh`);
-                    frame.data = [];
-                } else {
-                    frame.data = JSON.parse(data || '[]');
-                    if (!Array.isArray(frame.data)) {
-                        console.warn(`[INIT] Invalid JSON in ${frame.filename} - resetting to empty array`);
-                        frame.data = [];
-                    }
+                const lines = data.trim().split('\n').filter(line => line.trim());
+                if (lines.length > 0) {
+                    // Parse the last line (most recent candle)
+                    const lastCandle = JSON.parse(lines[lines.length - 1]);
+                    frame.lastClose = lastCandle.close;         // Set last known close price
+                    frame.lastFinalized = lastCandle.timestamp; // Set last finalized timestamp
+                    console.log(`[INIT] Loaded last close for ${asset} ${tf}: ${frame.lastClose} at ${frame.lastFinalized}`);
                 }
-                console.log(`[INIT] Loaded ${tf}: ${frame.data.length} candle(s)`);
             } catch (error) {
+                // Handle file not found (create new file later)
                 if (error.code === 'ENOENT') {
-                    console.log(`[INIT] No ${frame.filename} found - starting fresh`);
-                    frame.data = [];
-                } else if (error instanceof SyntaxError) {
-                    console.warn(`[INIT] Corrupted JSON in ${frame.filename} - starting fresh:`, error.message);
-                    frame.data = [];
+                    console.log(`[INIT] ${frame.filename} not found - will create on first save`);
                 } else {
-                    console.error(`[ERROR] Loading ${frame.filename}:`, error.message);
-                    frame.data = [];
+                    // Log other errors during file reading
+                    console.error(`[ERROR] Checking ${frame.filename}:`, error.message);
                 }
             }
-            
-            isSaving[tf] = false;
+            // Initialize saving flag for this asset/timeframe combination
+            isSaving[`${asset}_${tf}`] = false;
         }
-    } catch (error) {
-        console.error('[ERROR] Loading OHLC:', error.message);
     }
 }
 
-async function saveOhlcData(timeframe) {
-    if (isSaving[timeframe]) {
-        console.log(`[SAVE] Save already in progress for ${timeframe}, skipping`);
+/** Save OHLC candle to file with concurrency protection
+ * @param {string} asset - Cryptocurrency name
+ * @param {string} timeframe - Timeframe identifier (1m, 5m, 15m)
+ * @param {Object} candle - OHLC candle data to save
+ */
+async function saveOhlcData(asset, timeframe, candle) {
+    const key = `${asset}_${timeframe}`; // Unique key for this asset/timeframe
+    // Check if save operation is already in progress
+    if (isSaving[key]) {
+        console.log(`[SAVE] Save already in progress for ${key}, skipping`);
         return;
     }
 
-    isSaving[timeframe] = true;
-    const frame = timeframes[timeframe];
+    isSaving[key] = true; // Set saving flag
+    const frame = timeframes[asset][timeframe]; // Get timeframe data
     
     try {
-        if (frame.data.length === 0) {
-            console.log(`[SAVE] No data to save for ${timeframe}`);
-            return;
-        }
-
-        let existingData = [];
-        try {
-            const data = await readFile(frame.filename, 'utf8');
-            if (data.trim() === '') {
-                console.log(`[SAVE] Existing ${frame.filename} is empty - treating as new`);
-            } else {
-                existingData = JSON.parse(data);
-                if (!Array.isArray(existingData)) {
-                    console.warn(`[SAVE] Invalid JSON in ${frame.filename} - resetting to empty array`);
-                    existingData = [];
-                }
-            }
-        } catch (error) {
-            if (error.code === 'ENOENT') {
-                console.log(`[SAVE] No existing ${frame.filename} - creating new`);
-            } else if (error instanceof SyntaxError) {
-                console.warn(`[SAVE] Corrupted JSON in ${frame.filename} - starting fresh:`, error.message);
-            } else {
-                throw error;
-            }
-        }
-
-        const updatedData = existingData.concat(frame.data);
-        
-        const tempPath = `${frame.filename}.tmp`;
-        await writeFile(tempPath, JSON.stringify(updatedData, null, 2));
-        await rename(tempPath, frame.filename);
-        console.log(`[SAVE] Successfully saved ${frame.data.length} candle to ${frame.filename}`);
-
-        frame.data = [];
+        const line = JSON.stringify(candle) + '\n'; // Format candle as JSON with newline
+        await appendFile(frame.filename, line);     // Append to file
+        frame.lastClose = candle.close;             // Update last close price
+        frame.lastFinalized = candle.timestamp;     // Update last finalized timestamp
+        console.log(`[SAVE] Saved candle to ${frame.filename}: ${line.trim()}`);
     } catch (error) {
-        console.error(`[ERROR] Saving ${timeframe} OHLC:`, error.message);
+        // Log any errors during save operation
+        console.error(`[ERROR] Saving ${key} OHLC:`, error.message);
     } finally {
-        isSaving[timeframe] = false;
+        isSaving[key] = false; // Reset saving flag
     }
 }
 
-async function updateOhlc(price) {
-    const formattedPrice = parseFloat(price.toFixed(2));
-    const now = new Date();
+/** Update OHLC candles with new price data
+ * @param {Object} param - Price update data
+ * @param {number} param.price - Current price
+ * @param {string} param.asset - Cryptocurrency name
+ * @param {Date} param.timestamp - Update timestamp
+ */
+async function updateOhlc({ price, asset, timestamp }) {
+    const formattedPrice = parseFloat(price.toFixed(2)); // Round price to 2 decimals
+    const assetFrames = timeframes[asset];               // Get asset's timeframe data
 
-    for (const [tf, frame] of Object.entries(timeframes)) {
-        const intervalStart = getIntervalStart(now, frame.interval);
-        const intervalISO = intervalStart.toISOString();
+    // Validate price is within acceptable range
+    if (!assetFrames || formattedPrice < assets[asset].min || formattedPrice > assets[asset].max) {
+        console.log(`[OHLC] Skipped ${asset}: Price=${formattedPrice} out of range`);
+        return;
+    }
 
-        if (!frame.current || frame.current.timestamp !== intervalISO) {
+    // Update each timeframe for the asset
+    for (const [tf, frame] of Object.entries(assetFrames)) {
+        const intervalStart = getIntervalStart(timestamp, frame.interval); // Calculate interval start
+        const intervalISO = intervalStart.toISOString();                  // Convert to ISO string
+
+        // Check if new candle needs to be created
+        if (!frame.current || (frame.current.timestamp !== intervalISO && frame.lastFinalized !== frame.current.timestamp)) {
             if (frame.current) {
-                await finalizeOhlc(tf);
+                // Finalize existing candle if it exists
+                const oldCandle = frame.current;
+                frame.current = null;
+                await finalizeOhlc(asset, tf, oldCandle);
+                const prevClose = oldCandle.close;
+                // Start new candle with previous close as opening price
+                frame.current = {
+                    timestamp: intervalISO,
+                    open: prevClose,
+                    high: prevClose,
+                    low: prevClose,
+                    close: prevClose
+                };
+                console.log(`[OHLC ${asset} ${tf}] New candle: O=${prevClose.toFixed(2)} at ${intervalISO}`);
+            } else {
+                // Create first candle if none exists
+                const prevClose = frame.lastClose !== null ? frame.lastClose : formattedPrice;
+                frame.current = {
+                    timestamp: intervalISO,
+                    open: prevClose,
+                    high: prevClose,
+                    low: prevClose,
+                    close: prevClose
+                };
+                console.log(`[OHLC ${asset} ${tf}] New candle: O=${prevClose.toFixed(2)} at ${intervalISO}`);
             }
-            const prevClose = frame.current?.close || formattedPrice;
-            frame.current = {
-                timestamp: intervalISO,
-                open: prevClose,
-                high: prevClose,
-                low: prevClose,
-                close: prevClose
-            };
-            console.log(`[OHLC ${tf}] New candle: O=${prevClose.toFixed(2)}`);
         }
 
-        const candle = frame.current;
-        const updates = [];
-        if (formattedPrice > candle.high) {
-            updates.push(`High↑ ${candle.high.toFixed(2)}→${formattedPrice}`);
-            candle.high = formattedPrice;
-        }
-        if (formattedPrice < candle.low) {
-            updates.push(`Low↓ ${candle.low.toFixed(2)}→${formattedPrice}`);
-            candle.low = formattedPrice;
-        }
-        candle.close = formattedPrice;
+        const candle = frame.current; // Current candle being updated
+        // Update OHLC values if price changed
+        if (formattedPrice !== candle.close) {
+            const updates = []; // Track changes for logging
+            if (formattedPrice > candle.high) {
+                updates.push(`High↑ ${candle.high.toFixed(2)}→${formattedPrice}`);
+                candle.high = formattedPrice; // Update high price
+            }
+            if (formattedPrice < candle.low) {
+                updates.push(`Low↓ ${candle.low.toFixed(2)}→${formattedPrice}`);
+                candle.low = formattedPrice;  // Update low price
+            }
+            candle.close = formattedPrice;    // Update closing price
 
-        if (updates.length) {
-            console.log(`[OHLC ${tf}] Updated: ${updates.join(', ')}`);
+            // Log any updates
+            if (updates.length) {
+                console.log(`[OHLC ${asset} ${tf}] Updated: ${updates.join(', ')}`);
+            }
         }
     }
 }
 
-async function finalizeOhlc(timeframe) {
-    const frame = timeframes[timeframe];
-    if (!frame.current) return;
+/** Finalize an OHLC candle and save it to file
+ * @param {string} asset - Cryptocurrency name
+ * @param {string} timeframe - Timeframe identifier
+ * @param {Object} candle - Candle to finalize
+ */
+async function finalizeOhlc(asset, timeframe, candle) {
+    if (!candle) return; // Skip if no candle to finalize
 
-    console.log(`[OHLC ${timeframe}] Final: O=${frame.current.open} H=${frame.current.high} L=${frame.current.low} C=${frame.current.close}`);
-
-    const lastEntry = frame.data[frame.data.length - 1];
-    if (lastEntry?.timestamp === frame.current.timestamp) {
-        frame.data[frame.data.length - 1] = frame.current;
-    } else {
-        frame.data.push(frame.current);
-    }
-
-    if (frame.data.length >= MAX_BUFFER_SIZE) {
-        await saveOhlcData(timeframe).catch(error => {
-            console.error(`[ERROR] ${timeframe} buffer save failed:`, error.message);
-        });
-    } else {
-        await saveOhlcData(timeframe).catch(error => {
-            console.error(`[ERROR] ${timeframe} save failed:`, error.message);
-        });
-    }
+    // Log final OHLC values
+    console.log(`[OHLC ${asset} ${timeframe}] Final: O=${candle.open} H=${candle.high} L=${candle.low} C=${candle.close} at ${candle.timestamp}`);
+    await saveOhlcData(asset, timeframe, candle); // Save to file
 }
 
-async function initializeConnection() {
-    let retries = 5;
-    while (retries > 0) {
-        try {
-            const connection = new Connection(RPC_URL, {
-                wsEndpoint: WS_URL,
-                httpHeaders: { 'x-session-hash': SESSION_HASH },
-                commitment: 'confirmed'
-            });
-            const version = await connection.getVersion();
-            console.log('[CONNECTION] Connected:', version);
-            return connection;
-        } catch (error) {
-            retries--;
-            console.error(`[CONNECTION] Error (${retries} left):`, error.message);
-            if (retries === 0) throw error;
-            await new Promise(resolve => setTimeout(resolve, 10000));
+/** Connect to Kraken WebSocket API for price data */
+function connectKraken() {
+    const ws = new WebSocket('wss://ws.kraken.com'); // Create WebSocket connection
+    
+    // Handle connection opening
+    ws.on('open', () => {
+        console.log('[KRAKEN] Connected');
+        // Subscribe to ticker data for specified pairs
+        ws.send(JSON.stringify({
+            event: 'subscribe',
+            pair: ['XBT/USD', 'ETH/USD', 'SOL/USD'],
+            subscription: { name: 'ticker' }
+        }));
+    });
+
+    // Handle incoming messages
+    ws.on('message', (data) => {
+        const msg = JSON.parse(data);
+        // Process ticker data if present
+        if (Array.isArray(msg) && msg[1] && msg[1].c) {
+            const price = parseFloat(msg[1].c[0]); // Extract closing price
+            let asset; // Determine asset from pair
+            switch (msg[3]) {
+                case 'XBT/USD': asset = 'Bitcoin'; break;
+                case 'ETH/USD': asset = 'Ethereum'; break;
+                case 'SOL/USD': asset = 'Solana'; break;
+            }
+            if (asset) {
+                console.log(`[KRAKEN] ${asset} Price: ${price}`);
+                // Update OHLC with new price data
+                updateOhlc({ price, asset, timestamp: new Date() });
+            }
         }
-    }
+    });
+
+    // Handle WebSocket errors
+    ws.on('error', (error) => console.error('[KRAKEN] Error:', error.message));
+    // Handle connection close with automatic reconnect
+    ws.on('close', () => {
+        console.log('[KRAKEN] Disconnected, reconnecting...');
+        setTimeout(connectKraken, 5000); // Reconnect after 5 seconds
+    });
+
+    return ws; // Return WebSocket instance
 }
 
-async function monitorLogs() {
-    let connection;
-    try {
-        connection = await initializeConnection();
-        await loadOhlcData();
+/** Connect to Coinbase WebSocket API for price data */
+function connectCoinbase() {
+    const ws = new WebSocket('wss://ws-feed.exchange.coinbase.com'); // Create WebSocket connection
+    
+    // Handle connection opening
+    ws.on('open', () => {
+        console.log('[COINBASE] Connected');
+        // Subscribe to ticker channel for specified products
+        ws.send(JSON.stringify({
+            type: 'subscribe',
+            product_ids: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+            channels: ['ticker']
+        }));
+    });
 
-        console.log('[SYSTEM] Starting price monitoring...');
-        const subscriptionId = connection.onLogs(
-            publicKey,
-            ({ logs, err }) => {
-                const priceData = logs.flatMap(log => processPrice(log) || []);
-                if (priceData.length) {
-                    const finalPrice = priceData.length > 1 
-                        ? priceData.reduce((sum, p) => sum + p.price, 0) / priceData.length
-                        : priceData[0].price;
-                    updateOhlc(finalPrice);
-                }
-            },
-            'confirmed'
-        );
-        console.log('[SYSTEM] Subscription ID:', subscriptionId);
-    } catch (error) {
-        console.error('[ERROR] Monitor failed:', error.message);
-        console.log('[SYSTEM] Retrying in 10 seconds...');
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        await monitorLogs();
-    }
+    // Handle incoming messages
+    ws.on('message', (data) => {
+        const msg = JSON.parse(data);
+        // Process ticker data if present
+        if (msg.type === 'ticker' && msg.price) {
+            const price = parseFloat(msg.price); // Extract price
+            let asset; // Determine asset from product ID
+            switch (msg.product_id) {
+                case 'BTC-USD': asset = 'Bitcoin'; break;
+                case 'ETH-USD': asset = 'Ethereum'; break;
+                case 'SOL-USD': asset = 'Solana'; break;
+            }
+            if (asset) {
+                console.log(`[COINBASE] ${asset} Price: ${price}`);
+                // Update OHLC with new price data
+                updateOhlc({ price, asset, timestamp: new Date() });
+            }
+        }
+    });
+
+    // Handle WebSocket errors
+    ws.on('error', (error) => console.error('[COINBASE] Error:', error.message));
+    // Handle connection close with automatic reconnect
+    ws.on('close', () => {
+        console.log('[COINBASE] Disconnected, reconnecting...');
+        setTimeout(connectCoinbase, 5000); // Reconnect after 5 seconds
+    });
+
+    return ws; // Return WebSocket instance
 }
 
+/** Start WebSocket connections and initialize monitoring */
+async function startPriceMonitoring() {
+    await loadOhlcData(); // Load existing OHLC data first
+    console.log('[SYSTEM] Starting price monitoring...');
+    connectKraken();      // Start Kraken connection
+    connectCoinbase();    // Start Coinbase connection
+}
+
+/** Handle graceful shutdown on SIGINT (Ctrl+C) */
 process.on('SIGINT', async () => {
     console.log('\n[SYSTEM] Shutting down...');
-    for (const tf of Object.keys(timeframes)) {
-        await finalizeOhlc(tf);
-        await saveOhlcData(tf);
+    // Finalize all current candles before exit
+    for (const [asset, assetFrames] of Object.entries(timeframes)) {
+        for (const [tf, frame] of Object.entries(assetFrames)) {
+            if (frame.current && frame.lastFinalized !== frame.current.timestamp) {
+                await finalizeOhlc(asset, tf, frame.current);
+                frame.current = null; // Clear current candle
+            }
+        }
     }
-    process.exit(0);
+    process.exit(0); // Exit with success code
 });
 
+/** Handle uncaught exceptions to prevent crashes */
 process.on('uncaughtException', (error) => {
     console.error('[FATAL] Uncaught exception:', error.stack);
-    process.exit(1);
+    process.exit(1); // Exit with error code
 });
 
-monitorLogs().catch(error => {
+// Start the monitoring process with error handling
+startPriceMonitoring().catch(error => {
     console.error('[ERROR] Startup failed:', error.message);
-    process.exit(1);
+    process.exit(1); // Exit if startup fails
 });
